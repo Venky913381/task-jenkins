@@ -39,6 +39,6 @@ module "eks" {
 # create ECR repository
 module "ecr" {
   source = "./modules/ecr"
-  name = var.cluster_name
+  cluster_name    = var.cluster_name
 
 }
