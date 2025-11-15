@@ -1,0 +1,112 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['plan', 'apply', 'destroy'],
+            description: 'Terraform action to perform'
+        )
+        booleanParam(
+            name: 'AUTO_APPROVE',
+            defaultValue: false,
+            description: 'Auto-approve terraform apply/destroy'
+        )
+    }
+    
+    stages {
+        stage('Install Terraform') {
+            steps {
+                script {
+                    echo "Installing Terraform..."
+                    sh '''
+                        # Download Terraform
+                        curl -LO https://releases.hashicorp.com/terraform/1.5.0/terraform_1.5.0_linux_amd64.zip
+                        
+                        # Install unzip if not available
+                        if ! command -v unzip &> /dev/null; then
+                            echo "Installing unzip..."
+                            apt-get update && apt-get install -y unzip
+                        fi
+                        
+                        # Extract Terraform
+                        unzip -q terraform_1.5.0_linux_amd64.zip
+                        chmod +x terraform
+                        mv terraform /usr/local/bin/
+                        
+                        # Verify installation
+                        terraform version
+                    '''
+                }
+            }
+        }
+        
+        stage('Checkout Code') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/master']],
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/Venky913381/task-jenkins.git'
+                    ]]
+                ])
+                
+                dir('terraform_task') {
+                    sh '''
+                        echo "Repository contents:"
+                        ls -la
+                        echo "Terraform files:"
+                        find . -name "*.tf" -o -name "*.tfvars"
+                    '''
+                }
+            }
+        }
+        
+        stage('Terraform Operations') {
+            steps {
+                script {
+                    dir('terraform_task') {
+                        withCredentials([[
+                            $class: 'AmazonWebServicesCredentialsBinding',
+                            credentialsId: 'awscredentials',
+                            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                        ]]) {
+                            if (params.ACTION == 'plan') {
+                                sh '''
+                                    echo "Running Terraform plan..."
+                                    terraform init -input=false
+                                    terraform plan
+                                '''
+                            } else if (params.ACTION == 'apply') {
+                                if (!params.AUTO_APPROVE) {
+                                    input message: 'Apply Terraform changes?', ok: 'Apply'
+                                }
+                                sh '''
+                                    echo "Running Terraform apply..."
+                                    terraform init -input=false
+                                    terraform apply ${params.AUTO_APPROVE ? '-auto-approve' : ''}
+                                '''
+                            } else if (params.ACTION == 'destroy') {
+                                if (!params.AUTO_APPROVE) {
+                                    input message: 'Destroy infrastructure?', ok: 'Destroy'
+                                }
+                                sh '''
+                                    echo "Running Terraform destroy..."
+                                    terraform init -input=false
+                                    terraform destroy ${params.AUTO_APPROVE ? '-auto-approve' : ''}
+                                '''
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
