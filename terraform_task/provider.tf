@@ -16,7 +16,7 @@ terraform {
   backend "s3" {
     bucket         = "terraform-stateajbailfb"
     key            = "global/terraform.tfstate"   # path inside bucket; change per env (e.g., dev/terraform.tfstate)
-    region         = var.aws_region                # change to your region
+    region         = "us-east-1"               # change to your region
     dynamodb_table = "terraform-state-locks"      # for state locking
     encrypt        = true
   }
