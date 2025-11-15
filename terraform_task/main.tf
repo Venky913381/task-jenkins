@@ -34,3 +34,11 @@ module "eks" {
   max_size              = var.max_size
   min_size              = var.min_size
 }
+
+
+# create ECR repository
+module "ecr" {
+  source = "./modules/ecr"
+  name = var.cluster_name
+
+}
