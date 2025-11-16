@@ -1,0 +1,303 @@
+pipeline {
+    agent any
+    
+    environment {
+        AWS_REGION = 'us-east-1'
+        ECR_REPOSITORY = 'task-cluster'
+        CLUSTER_NAME = 'task-cluster'
+        K8S_DIR = 'terraform_task/EKS'
+    }
+    
+    stages {
+        stage('Install AWS CLI and kubectl') {
+            steps {
+                script {
+                    echo '🔧 Installing required tools...'
+                    sh '''
+                        # Install AWS CLI
+                        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                        unzip -q -o awscliv2.zip
+                        ./aws/install --update
+                        
+                        # Install kubectl - fixed method
+                        curl -LO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+                        install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+                        
+                        # Verify installations
+                        aws --version
+                        kubectl version --client
+                        echo "✅ Tools installed successfully"
+                    '''
+                }
+            }
+        }
+        
+        stage('Manual Code Setup') {
+            steps {
+                script {
+                    echo '📥 Setting up code manually...'
+                    sh '''
+                        if [ ! -d "terraform_task" ]; then
+                            echo "❌ Code directory not found"
+                            exit 1
+                        else
+                            echo "✅ Code directory found"
+                            ls -la terraform_task/
+                            echo "K8s files in EKS directory:"
+                            ls -la ${K8S_DIR}/
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage('Build and Deploy to EKS') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'awscredentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    script {
+                        echo '🐳 Building Docker image and deploying to EKS...'
+                        
+                        // Build and push Docker image
+                        dir('terraform_task/Application') {
+                            sh '''
+                                # Build Docker image
+                                docker build -t ${ECR_REPOSITORY}:${BUILD_NUMBER} .
+                                
+                                # Get ECR registry
+                                ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                                ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+                                
+                                echo "ECR Registry: ${ECR_REGISTRY}"
+                                
+                                # Ensure ECR repo exists
+                                aws ecr describe-repositories --repository-names ${ECR_REPOSITORY} --region ${AWS_REGION} || \
+                                aws ecr create-repository --repository-name ${ECR_REPOSITORY} --region ${AWS_REGION}
+                                
+                                # Login to ECR
+                                aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                                
+                                # Tag and push images
+                                docker tag ${ECR_REPOSITORY}:${BUILD_NUMBER} ${ECR_REGISTRY}:${BUILD_NUMBER}
+                                docker push ${ECR_REGISTRY}:${BUILD_NUMBER}
+                                
+                                echo "✅ Successfully built and pushed to ECR: ${ECR_REGISTRY}:${BUILD_NUMBER}"
+                            '''
+                        }
+                        
+                        // Update manifest and deploy to EKS
+                        sh '''
+                            # Get ECR registry URL
+                            ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                            ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+                            NEW_IMAGE="${ECR_REGISTRY}:${BUILD_NUMBER}"
+                            
+                            echo "Updating Kubernetes manifest with image: ${NEW_IMAGE}"
+                            
+                            # Update the nginx.yml file with the new image tag
+                            sed -i "s|image:.*|image: ${NEW_IMAGE}|g" ${K8S_DIR}/nginx.yml
+                            
+                            # Display the updated file
+                            echo "Updated nginx.yml content:"
+                            cat ${K8S_DIR}/nginx.yml
+                            
+                            # Configure EKS access
+                            echo "🔗 Configuring EKS cluster access..."
+                            aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+                            
+                            # Verify cluster access
+                            kubectl get nodes
+                            echo "✅ EKS cluster access configured successfully"
+                            
+                            # Deploy all Kubernetes manifests in the EKS directory
+                            echo "🚀 Deploying all Kubernetes manifests from ${K8S_DIR}..."
+                            
+                            # Apply all YAML files in the EKS directory
+                            for file in ${K8S_DIR}/*.yml ${K8S_DIR}/*.yaml; do
+                                if [ -f "$file" ]; then
+                                    echo "Applying: $file"
+                                    kubectl apply -f "$file"
+                                fi
+                            done
+                            
+                            # Wait for deployment to be ready
+                            echo "⏳ Waiting for deployment to be ready..."
+                            kubectl rollout status deployment/nginx-deployment --timeout=300s
+                            
+                            echo "✅ All Kubernetes manifests deployed successfully"
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Verify Deployment') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'awscredentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    script {
+                        echo '🔍 Verifying deployment...'
+                        sh '''
+                            # Configure EKS access again for this stage
+                            aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+                            
+                            echo "=== Cluster Overview ==="
+                            kubectl get pods -A
+                            echo ""
+                            
+                            echo "=== Ingress Resources ==="
+                            kubectl get ing -A
+                            echo ""
+                            
+                            echo "=== Secrets ==="
+                            kubectl get secrets -A
+                            echo ""
+                            
+                            echo "=== Deployments ==="
+                            kubectl get deployments -A
+                            echo ""
+                            
+                            echo "=== Services ==="
+                            kubectl get services -A
+                            echo ""
+                            
+                            echo "=== All Resources in Default Namespace ==="
+                            kubectl get all
+                            echo ""
+                            
+                            # Check if pods are running
+                            echo "=== Nginx Pods ==="
+                            kubectl get pods -l app=nginx
+                            echo ""
+                            
+                            # Check service details
+                            echo "=== Nginx Service Details ==="
+                            kubectl describe service nginx-service
+                            echo ""
+                            
+                            # Get Ingress URL
+                            INGRESS_URL=$(kubectl get ingress eks-alb-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Not available yet")
+                            echo "🌐 Ingress URL: http://${INGRESS_URL}"
+                            
+                            echo "✅ Deployment verified successfully"
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Post-Deployment Checks') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'awscredentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    script {
+                        echo '📊 Running post-deployment checks...'
+                        sh '''
+                            # Configure EKS access
+                            aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+                            
+                            echo "=== Final Cluster Status ==="
+                            echo "📦 All Pods:"
+                            kubectl get pods -A --sort-by='.metadata.name'
+                            echo ""
+                            
+                            echo "🌐 All Ingress:"
+                            kubectl get ingress -A
+                            echo ""
+                            
+                            echo "🔐 All Secrets:"
+                            kubectl get secrets -A
+                            echo ""
+                            
+                            echo "🔄 All Deployments:"
+                            kubectl get deployments -A
+                            echo ""
+                            
+                            echo "🔧 All Services:"
+                            kubectl get services -A
+                            echo ""
+                            
+                            echo "🎯 Application Status:"
+                            kubectl get deployment nginx-deployment -o wide
+                            kubectl get service nginx-service -o wide
+                            kubectl get ingress eks-alb-ingress -o wide
+                            
+                            # Get final application URL
+                            FINAL_URL=$(kubectl get ingress eks-alb-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Check ingress in a few minutes")
+                            echo ""
+                            echo "🚀 DEPLOYMENT COMPLETE!"
+                            echo "🌍 Your application will be available at: http://${FINAL_URL}"
+                            echo "📝 Note: It may take a few minutes for the Load Balancer to become fully available"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo '🎉 Pipeline execution completed!'
+                sh '''
+                    echo "Build: ${BUILD_NUMBER}" > build-info.txt
+                    echo "ECR Repo: ${ECR_REPOSITORY}" >> build-info.txt
+                    echo "Region: ${AWS_REGION}" >> build-info.txt
+                    echo "EKS Cluster: ${CLUSTER_NAME}" >> build-info.txt
+                    echo "K8s Directory: ${K8S_DIR}" >> build-info.txt
+                    echo "Date: $(date)" >> build-info.txt
+                '''
+                archiveArtifacts artifacts: 'build-info.txt', allowEmptyArchive: true
+            }
+        }
+        success {
+            script {
+                echo '✅ Pipeline executed successfully!'
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'awscredentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    sh '''
+                        # Get the final URL
+                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${CLUSTER_NAME}
+                        FINAL_URL=$(kubectl get ingress eks-alb-ingress -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Check ingress in a few minutes")
+                        echo "🎯 APPLICATION DEPLOYED SUCCESSFULLY!"
+                        echo "🌐 Access your application at: http://${FINAL_URL}"
+                        echo ""
+                        echo "📊 Deployment Summary:"
+                        echo "   - ECR Image: ${ECR_REPOSITORY}:${BUILD_NUMBER}"
+                        echo "   - EKS Cluster: ${CLUSTER_NAME}"
+                        echo "   - Region: ${AWS_REGION}"
+                        echo "   - All K8s manifests deployed from: ${K8S_DIR}"
+                        echo ""
+                        echo "⚠️  Note: The Load Balancer may take 2-5 minutes to become fully available"
+                    '''
+                }
+            }
+        }
+        failure {
+            script {
+                echo '❌ Pipeline execution failed!'
+                sh '''
+                    echo "Debugging information:"
+                    echo "Kubectl installation failed. Check the tools installation stage."
+                    echo "The issue might be with network connectivity or the kubectl download URL."
+                '''
+            }
+        }
+    }
+}
